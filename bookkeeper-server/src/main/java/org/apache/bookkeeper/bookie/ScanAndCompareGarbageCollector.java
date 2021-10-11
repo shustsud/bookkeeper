@@ -231,22 +231,18 @@ public class ScanAndCompareGarbageCollector implements GarbageCollector {
 
     private Set<Long> removeOverReplicatedledgers(Set<Long> bkActiveledgers, final GarbageCleaner garbageCleaner)
             throws InterruptedException, KeeperException {
-        // Check ledger ensembles before creating lock nodes.
-        // This is to reduce the number of lock node creations and deletions in ZK.
-        // The ensemble check is done again after the lock node is created.
-        final Set<Long> candidateOverReplicatedLedgers = preCheckOverReplicatedLedgers(bkActiveledgers);
-        if (candidateOverReplicatedLedgers.isEmpty()) {
-            return candidateOverReplicatedLedgers;
-        }
-
         final List<ACL> zkAcls = ZkUtils.getACLs(conf);
         final Set<Long> overReplicatedLedgers = Sets.newHashSet();
         final Semaphore semaphore = new Semaphore(MAX_CONCURRENT_ZK_REQUESTS);
-        final CountDownLatch latch = new CountDownLatch(candidateOverReplicatedLedgers.size());
-        for (final Long ledgerId : candidateOverReplicatedLedgers) {
+        final CountDownLatch latch = new CountDownLatch(bkActiveledgers.size());
+        for (final Long ledgerId : bkActiveledgers) {
             try {
-                // check if the ledger is being replicated already by the replication worker
-                if (ZkLedgerUnderreplicationManager.isLedgerBeingReplicated(zk, zkLedgersRootPath, ledgerId)) {
+                // check ledger ensembles before creating lock nodes.
+                // this is to reduce the number of lock node creations and deletions in ZK.
+                // the ensemble check is done again after the lock node is created.
+                // also, check if the ledger is being replicated already by the replication worker
+                if (!isNotBookieIncludedInLedgerEnsembles(ledgerManager.readLedgerMetadata(ledgerId).get())
+                        || ZkLedgerUnderreplicationManager.isLedgerBeingReplicated(zk, zkLedgersRootPath, ledgerId)) {
                     latch.countDown();
                     continue;
                 }
@@ -287,38 +283,6 @@ public class ScanAndCompareGarbageCollector implements GarbageCollector {
         latch.await();
         bkActiveledgers.removeAll(overReplicatedLedgers);
         return overReplicatedLedgers;
-    }
-
-    private Set<Long> preCheckOverReplicatedLedgers(Set<Long> bkActiveLedgers) throws InterruptedException {
-        final Set<Long> candidateOverReplicatedLedgers = Sets.newHashSet();
-        final Semaphore semaphore = new Semaphore(MAX_CONCURRENT_ZK_REQUESTS);
-        final CountDownLatch latch = new CountDownLatch(bkActiveLedgers.size());
-
-        for (final Long ledgerId : bkActiveLedgers) {
-            try {
-                semaphore.acquire();
-                ledgerManager.readLedgerMetadata(ledgerId)
-                        .whenComplete((metadata, exception) -> {
-                            try {
-                                if (exception == null) {
-                                    if (isNotBookieIncludedInLedgerEnsembles(metadata)) {
-                                        candidateOverReplicatedLedgers.add(ledgerId);
-                                    }
-                                }
-                            } finally {
-                                semaphore.release();
-                                latch.countDown();
-                            }
-                        });
-            } catch (Throwable t) {
-                LOG.error("Exception when iterating through the ledgers to pre-check for over-replication", t);
-                latch.countDown();
-            }
-        }
-        latch.await();
-        LOG.info("Finished pre-check over-replicated ledgers. Over-replicated ledgers pre-check count: {}/{}",
-                candidateOverReplicatedLedgers.size(), bkActiveLedgers.size());
-        return candidateOverReplicatedLedgers;
     }
 
     private boolean isNotBookieIncludedInLedgerEnsembles(Versioned<LedgerMetadata> metadata) {
